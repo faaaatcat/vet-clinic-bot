@@ -1,0 +1,1897 @@
+Листинг проекта: .
+Создан: 2025-11-21 23:32:25
+==================================================
+
+
+============================================================
+ФАЙЛ: bot.py
+============================================================
+
+import asyncio
+import logging
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.fsm.storage.memory import MemoryStorage
+
+from config import BOT_TOKEN
+from db.db_init import init_db
+
+# Роутеры
+from handlers import registration, pets, booking, common, notifications, appointments, calendar
+
+# === Логирование ===
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+# === Инициализация базы данных ===
+init_db()
+logging.info("✅ База данных успешно инициализирована.")
+
+# === Настройка бота и диспетчера ===
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+# === Подключение роутеров в правильном порядке ===
+# Важный момент: booking подключается до common, чтобы 'Мои записи' не перехватывались
+dp.include_router(registration.router)
+dp.include_router(pets.router)
+dp.include_router(booking.router)
+dp.include_router(common.router)
+dp.include_router(notifications.router)
+dp.include_router(appointments.router)
+
+
+async def main():
+    logging.info("🚀 Бот запущен")
+
+    # Запускаем фоновую задачу уведомлений
+    asyncio.create_task(notifications.check_and_send_notifications(bot))
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+        logging.info("🛑 Бот остановлен")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+============================================================
+ФАЙЛ: combine_code.py
+============================================================
+
+import os
+from datetime import datetime
+
+def create_code_listing(project_path, output_file, extensions=['.py', '.txt', '.md']):
+    with open(output_file, 'w', encoding='utf-8') as outfile:
+        outfile.write(f"Листинг проекта: {os.path.basename(project_path)}\n")
+        outfile.write(f"Создан: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        outfile.write("="*50 + "\n\n")
+        
+        for root, dirs, files in os.walk(project_path):
+            # Пропускаем служебные папки
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['__pycache__', 'venv']]
+            
+            for file in files:
+                if any(file.endswith(ext) for ext in extensions):
+                    file_path = os.path.join(root, file)
+                    relative_path = os.path.relpath(file_path, project_path)
+                    
+                    outfile.write(f"\n{'='*60}\n")
+                    outfile.write(f"ФАЙЛ: {relative_path}\n")
+                    outfile.write(f"{'='*60}\n\n")
+                    
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as infile:
+                            content = infile.read()
+                            outfile.write(content)
+                            outfile.write("\n")
+                    except Exception as e:
+                        outfile.write(f"Ошибка чтения файла: {e}\n")
+
+if __name__ == "__main__":
+    project_path = "."  # Текущая папка
+    output_file = "project_listing.txt"
+    create_code_listing(project_path, output_file)
+    print(f"Листинг создан: {output_file}")
+
+
+============================================================
+ФАЙЛ: config.py
+============================================================
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN не найден в .env! Добавь его перед запуском.")
+
+
+============================================================
+ФАЙЛ: project_listing.txt
+============================================================
+
+
+
+============================================================
+ФАЙЛ: requirements.txt
+============================================================
+
+aiogram==3.12.0
+apscheduler==3.10.4
+python-dotenv==1.0.1
+aiogram3-calendar
+
+
+
+============================================================
+ФАЙЛ: db\db_init.py
+============================================================
+
+# db/db_init.py
+import sqlite3
+from pathlib import Path
+from datetime import date, timedelta
+from db.db_utils import generate_schedule_for_all_doctors
+
+DB_PATH = Path("db/vet_clinic.db")
+
+def init_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    # === Создание таблиц ===
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id INTEGER UNIQUE NOT NULL,
+        phone TEXT,
+        full_name TEXT,
+        reg_date TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS pets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        species TEXT,
+        age TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS doctors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        full_name TEXT NOT NULL,
+        specialty TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS services (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        duration INTEGER NOT NULL,
+        price REAL
+    );
+
+    -- Связь: какие услуги делает какой врач
+    CREATE TABLE IF NOT EXISTS doctor_services (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        doctor_id INTEGER NOT NULL,
+        service_id INTEGER NOT NULL,
+        FOREIGN KEY (doctor_id) REFERENCES doctors(id) ON DELETE CASCADE,
+        FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+        UNIQUE (doctor_id, service_id)
+    );
+
+    -- Расписание: слоты (один слот = один час)
+    CREATE TABLE IF NOT EXISTS schedule (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        doctor_id INTEGER NOT NULL,
+        date TEXT NOT NULL,   -- ISO: YYYY-MM-DD
+        time TEXT NOT NULL,   -- HH:MM (start time)
+        is_booked INTEGER DEFAULT 0,
+        UNIQUE (doctor_id, date, time),
+        FOREIGN KEY (doctor_id) REFERENCES doctors(id) ON DELETE CASCADE
+    );
+
+    -- Записи: привязка к schedule
+    CREATE TABLE IF NOT EXISTS appointments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        pet_id INTEGER NOT NULL,
+        doctor_id INTEGER NOT NULL,
+        service_id INTEGER NOT NULL,
+        schedule_id INTEGER NOT NULL,
+        status TEXT DEFAULT 'scheduled',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP, notified_24h INTEGER DEFAULT 0, notified_2h INTEGER DEFAULT 0, 
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (pet_id) REFERENCES pets(id),
+        FOREIGN KEY (doctor_id) REFERENCES doctors(id),
+        FOREIGN KEY (service_id) REFERENCES services(id),
+        FOREIGN KEY (schedule_id) REFERENCES schedule(id)
+    );
+    """)
+
+    conn.commit()
+    conn.close()
+
+    # После создания таблиц генерируем расписание на 14 дней вперёд
+    generate_schedule_for_all_doctors()
+    print("✅ База данных успешно инициализирована и расписание сгенерировано.")
+
+
+============================================================
+ФАЙЛ: db\db_utils.py
+============================================================
+
+# db/db_utils.py:
+import sqlite3
+from pathlib import Path
+from datetime import date, timedelta
+
+DB_PATH = Path("db/vet_clinic.db")
+
+
+def connect():
+    """Подключение к базе данных."""
+    return sqlite3.connect(DB_PATH)
+
+
+# =========================
+# Doctors / Services
+# =========================
+def get_doctors():
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, full_name, specialty FROM doctors ORDER BY full_name")
+        return cur.fetchall()
+
+
+def add_doctor(full_name, specialty):
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO doctors (full_name, specialty) VALUES (?, ?)", (full_name, specialty))
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_services():
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, name, duration, price FROM services ORDER BY name")
+        return cur.fetchall()
+
+
+def add_service(name, duration, price):
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO services (name, duration, price) VALUES (?, ?, ?)", (name, duration, price))
+        conn.commit()
+        return cur.lastrowid
+
+
+# =========================
+# Users / Pets
+# =========================
+def get_user_by_telegram_id(tg_id):
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, telegram_id, phone, full_name FROM users WHERE telegram_id=?", (tg_id,))
+        return cur.fetchone()
+
+
+def get_user_by_phone(phone):
+    """Возвращает пользователя по номеру телефона."""
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, telegram_id, phone, full_name FROM users WHERE phone=?", (phone,))
+        return cur.fetchone()
+
+
+def add_user(telegram_id, phone=None, full_name=None):
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO users (telegram_id, phone, full_name) VALUES (?, ?, ?)",
+            (telegram_id, phone, full_name)
+        )
+        conn.commit()
+        cur.execute("SELECT id FROM users WHERE telegram_id=?", (telegram_id,))
+        return cur.fetchone()[0]
+
+
+def add_pet(user_id, name, species=None, age=None):
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO pets (user_id, name, species, age) VALUES (?, ?, ?, ?)",
+                    (user_id, name, species, age))
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_user_pets(user_id):
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, name, species, age FROM pets WHERE user_id=? ORDER BY id", (user_id,))
+        return cur.fetchall()
+
+
+# =========================
+# Schedule & Booking
+# =========================
+def generate_schedule_for_all_doctors(days_ahead=14, work_start=9, work_end=19):
+    """
+    Генерирует слоты для всех врачей на ближайшие `days_ahead` дней.
+    Врачи работают пн-пт, слоты каждый час: от work_start до work_end-1.
+    """
+    today = date.today()
+    end_date = today + timedelta(days=days_ahead)
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM doctors")
+        doctors = [r[0] for r in cur.fetchall()]
+        for doctor_id in doctors:
+            current = today
+            while current <= end_date:
+                if current.weekday() < 5:  # пн-пт
+                    iso = current.isoformat()
+                    for h in range(work_start, work_end):
+                        time_str = f"{h:02d}:00"
+                        try:
+                            cur.execute(
+                                "INSERT OR IGNORE INTO schedule (doctor_id, date, time, is_booked) VALUES (?, ?, ?, 0)",
+                                (doctor_id, iso, time_str)
+                            )
+                        except sqlite3.IntegrityError:
+                            pass
+                current += timedelta(days=1)
+        conn.commit()
+
+
+def cleanup_old_schedule(keep_days=14):
+    """Удаляет старые слоты и оставляет только ближайшие `keep_days` дней."""
+    today = date.today()
+    cutoff = today - timedelta(days=1)
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM schedule WHERE date < ?", (cutoff.isoformat(),))
+        conn.commit()
+
+
+def get_available_dates_for_doctor(doctor_id, limit_days=14, limit_dates=14):
+    today = date.today()
+    end_date = today + timedelta(days=limit_days)
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT date
+            FROM schedule
+            WHERE doctor_id=? AND is_booked=0 AND date BETWEEN ? AND ?
+            ORDER BY date
+            LIMIT ?
+        """, (doctor_id, today.isoformat(), end_date.isoformat(), limit_dates))
+        return [r[0] for r in cur.fetchall()]
+
+
+def get_available_slots_for_doctor_on_date(doctor_id, date_iso):
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, time
+            FROM schedule
+            WHERE doctor_id=? AND date=? AND is_booked=0
+            ORDER BY time
+        """, (doctor_id, date_iso))
+        return cur.fetchall()
+
+
+def book_slot(schedule_id, user_id, pet_id, service_id):
+    """Бронирует слот и создаёт запись в appointments."""
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT doctor_id, date, time, is_booked FROM schedule WHERE id=?", (schedule_id,))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError("Слот не найден")
+        doctor_id, date_iso, time_str, is_booked = row
+        if is_booked:
+            raise ValueError("Слот уже занят")
+
+        # помечаем слот как забронированный
+        cur.execute("UPDATE schedule SET is_booked=1 WHERE id=?", (schedule_id,))
+
+        # создаём appointment
+        cur.execute("""
+            INSERT INTO appointments (user_id, pet_id, doctor_id, service_id, schedule_id, status)
+            VALUES (?, ?, ?, ?, ?, 'scheduled')
+        """, (user_id, pet_id, doctor_id, service_id, schedule_id))
+        appointment_id = cur.lastrowid
+        conn.commit()
+        return appointment_id
+
+
+def get_user_appointments(user_id):
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT a.id, s.name, d.full_name, sch.date, sch.time, a.status, p.name
+            FROM appointments a
+            JOIN services s ON a.service_id = s.id
+            JOIN doctors d ON a.doctor_id = d.id
+            JOIN schedule sch ON a.schedule_id = sch.id
+            JOIN pets p ON a.pet_id = p.id
+            WHERE a.user_id = ?
+            ORDER BY sch.date, sch.time
+        """, (user_id,))
+        return cur.fetchall()
+
+
+def cancel_appointment(appointment_id: int, free_slot: bool = False) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    try:
+        # Сначала получаем schedule_id этой записи
+        cur.execute("SELECT schedule_id FROM appointments WHERE id = ?", (appointment_id,))
+        result = cur.fetchone()
+        if not result:
+            return False
+        schedule_id = result[0]
+
+        # Удаляем запись
+        cur.execute("DELETE FROM appointments WHERE id = ?", (appointment_id,))
+
+        # Освобождаем слот, если нужно
+        if free_slot:
+            cur.execute("UPDATE schedule SET is_booked = 0 WHERE id = ?", (schedule_id,))
+
+        conn.commit()
+        return True
+    except Exception as e:
+        print("Ошибка при отмене записи:", e)
+        return False
+    finally:
+        conn.close()
+
+
+def get_doctors_by_service(service_id):
+    """Возвращает список врачей, которые делают выбранную услугу"""
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT d.id, d.full_name, d.specialty
+            FROM doctors d
+            JOIN doctor_services ds ON d.id = ds.doctor_id
+            WHERE ds.service_id = ?
+            ORDER BY d.full_name
+        """, (service_id,))
+        return cur.fetchall()
+
+============================================================
+ФАЙЛ: db\__init__.py
+============================================================
+
+
+
+============================================================
+ФАЙЛ: handlers\appointments.py
+============================================================
+
+from aiogram import Router, F
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from datetime import date
+from db.db_utils import get_user_by_telegram_id, get_user_appointments, cancel_appointment
+from handlers.common import main_menu_inline
+
+router = Router()
+
+
+# --- Универсальная клавиатура для списка записей ---
+def appointments_kb(appointments):
+    buttons = []
+    for a in appointments:
+        appointment_id = a[0]
+        buttons.append([InlineKeyboardButton(text=f"❌ Отменить: {a[6]} ({a[3]} {a[4]})", callback_data=f"cancel_appointment_{appointment_id}")])
+    buttons.append([InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# --- Показать актуальные записи ---
+@router.callback_query(F.data == "my_appointments")
+async def show_my_appointments(callback: CallbackQuery):
+    user = get_user_by_telegram_id(callback.from_user.id)
+    if not user:
+        await callback.message.answer("❗ Вы не зарегистрированы. Введите /start.")
+        await callback.answer()
+        return
+
+    appointments = get_user_appointments(user[0])
+    today_iso = date.today().isoformat()
+
+    # Фильтруем актуальные (сегодня и будущие)
+    upcoming = [a for a in appointments if a[3] >= today_iso]
+
+    if not upcoming:
+        await callback.message.edit_text(
+            "📅 У вас нет актуальных записей.",
+            reply_markup=main_menu_inline()
+        )
+        await callback.answer()
+        return
+
+    # Собираем все записи в одно сообщение
+    text_parts = []
+    for a in upcoming:
+        appointment_id, service_name, doctor_name, appt_date, appt_time, status, pet_name = a
+        text_parts.append(
+            f"🐾 <b>{pet_name}</b>\n"
+            f"👩‍⚕️ <b>{doctor_name}</b>\n"
+            f"🧾 {service_name}\n"
+            f"📅 {appt_date} — {appt_time}\n"
+            f"📌 Статус: <i>{status}</i>\n"
+            "────────────────────"
+        )
+
+    text = "📋 <b>Ваши актуальные записи:</b>\n\n" + "\n\n".join(text_parts)
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=appointments_kb(upcoming),
+        parse_mode="HTML"
+    )
+
+    await callback.answer()
+
+
+# --- Обработка отмены записи ---
+@router.callback_query(F.data.startswith("cancel_appointment_"))
+async def cancel_appointment_handler(callback: CallbackQuery):
+    appointment_id = int(callback.data.split("_")[-1])
+
+    # Попытка удалить запись и освободить слот
+    success = cancel_appointment(appointment_id, free_slot=True)
+
+    if success:
+        await callback.answer("✅ Запись отменена!", show_alert=False)
+
+        # После удаления — обновляем список записей
+        user = get_user_by_telegram_id(callback.from_user.id)
+        appointments = get_user_appointments(user[0])
+        today_iso = date.today().isoformat()
+        upcoming = [a for a in appointments if a[3] >= today_iso]
+
+        if upcoming:
+            text_parts = []
+            for a in upcoming:
+                appointment_id, service_name, doctor_name, appt_date, appt_time, status, pet_name = a
+                text_parts.append(
+                    f"🐾 <b>{pet_name}</b>\n"
+                    f"👩‍⚕️ <b>{doctor_name}</b>\n"
+                    f"🧾 {service_name}\n"
+                    f"📅 {appt_date} — {appt_time}\n"
+                    f"📌 Статус: <i>{status}</i>\n"
+                    "────────────────────"
+                )
+            text = "📋 <b>Ваши актуальные записи:</b>\n\n" + "\n\n".join(text_parts)
+            await callback.message.edit_text(text, reply_markup=appointments_kb(upcoming), parse_mode="HTML")
+        else:
+            await callback.message.edit_text("📅 У вас больше нет актуальных записей.", reply_markup=main_menu_inline())
+
+    else:
+        await callback.answer("⚠️ Не удалось удалить запись.", show_alert=True)
+
+
+============================================================
+ФАЙЛ: handlers\booking.py
+============================================================
+
+# handlers/booking.py
+from aiogram import Router, F
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+
+from db.db_utils import (
+    get_user_by_telegram_id,
+    get_services,
+    get_doctors_by_service,
+    get_available_dates_for_doctor,
+    get_available_slots_for_doctor_on_date,
+    get_user_pets,
+    book_slot
+)
+from handlers.common import main_menu_inline
+from handlers.calendar import SimpleCalendar, SimpleCalendarCallback
+
+router = Router()
+
+
+# === FSM состояния ===
+class BookingStates(StatesGroup):
+    service = State()
+    doctor = State()
+    date = State()
+    time = State()
+    pet = State()
+
+
+# === Вспомогательные строители клавиатур ===
+def build_list_kb(items, footer_rows=None):
+    """
+    items: list of tuples (text, callback_data) -> каждая в своей строке
+    footer_rows: list of rows, where each row is list of tuples (text, callback)
+    Возвращает InlineKeyboardMarkup
+    """
+    kb_rows = []
+    for txt, cb in items:
+        kb_rows.append([InlineKeyboardButton(text=txt, callback_data=cb)])
+    if footer_rows:
+        for row in footer_rows:
+            kb_rows.append([InlineKeyboardButton(text=t, callback_data=c) for (t, c) in row])
+    return InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+
+def nav_footer(back_cb: str = None):
+    """Возвращает footer rows для build_list_kb"""
+    footer = []
+    if back_cb:
+        footer.append(("🔙 Назад", back_cb))
+    footer.append(("🏠 В меню", "back_to_menu"))
+    return [footer]
+
+
+# === Старт записи: выбираем услугу ===
+@router.callback_query(F.data == "book_visit")
+async def start_booking(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    user = get_user_by_telegram_id(callback.from_user.id)
+    if not user:
+        await callback.message.answer("❗ Вы не зарегистрированы. Введите /start, чтобы начать.")
+        return
+
+    services = get_services()
+    if not services:
+        await callback.message.answer("⚠️ Пока нет доступных услуг.")
+        return
+
+    items = [(f"{s[1]} — {s[3]}₽", f"choose_service_{s[0]}") for s in services]
+    kb = build_list_kb(items, footer_rows=nav_footer())
+
+    try:
+        await callback.message.edit_text("🧾 Выберите услугу:", reply_markup=kb)
+    except Exception:
+        await callback.message.answer("🧾 Выберите услугу:", reply_markup=kb)
+
+    await state.set_state(BookingStates.service)
+
+
+# === Выбор услуги -> список врачей (фильтр по услуге) ===
+@router.callback_query(BookingStates.service, F.data.startswith("choose_service_"))
+async def choose_service(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    try:
+        service_id = int(callback.data.split("_")[-1])
+    except Exception:
+        await callback.message.answer("❌ Неправильный формат выбора услуги.")
+        return
+
+    await state.update_data(service_id=service_id)
+
+    doctors = get_doctors_by_service(service_id)
+    if not doctors:
+        try:
+            await callback.message.edit_text("⚠️ К сожалению, нет врачей, выполняющих эту услугу.")
+        except Exception:
+            await callback.message.answer("⚠️ К сожалению, нет врачей, выполняющих эту услугу.")
+        return
+
+    items = [(f"{d[1]} ({d[2] or 'специальность'})", f"choose_doctor_{d[0]}") for d in doctors]
+    kb = build_list_kb(items, footer_rows=nav_footer("back_to_service"))
+
+    try:
+        await callback.message.edit_text("👩‍⚕️ Выберите врача (отфильтровано по услуге):", reply_markup=kb)
+    except Exception:
+        await callback.message.answer("👩‍⚕️ Выберите врача (отфильтровано по услуге):", reply_markup=kb)
+
+    await state.set_state(BookingStates.doctor)
+
+
+# === Назад к выбору услуги ===
+@router.callback_query(BookingStates.doctor, F.data == "back_to_service")
+async def back_to_service(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    services = get_services()
+    items = [(f"{s[1]} — {s[3]}₽", f"choose_service_{s[0]}") for s in services]
+    kb = build_list_kb(items, footer_rows=nav_footer())
+    try:
+        await callback.message.edit_text("🧾 Выберите услугу:", reply_markup=kb)
+    except Exception:
+        await callback.message.answer("🧾 Выберите услугу:", reply_markup=kb)
+    await state.set_state(BookingStates.service)
+
+
+# === Выбор врача -> даты ===
+@router.callback_query(BookingStates.doctor, F.data.startswith("choose_doctor_"))
+async def choose_doctor(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    try:
+        doctor_id = int(callback.data.split("_")[-1])
+    except Exception:
+        await callback.message.answer("❌ Неправильный формат выбора врача.")
+        return
+
+    await state.update_data(doctor_id=doctor_id)
+
+    dates = get_available_dates_for_doctor(doctor_id)
+    if not dates:
+        try:
+            await callback.message.edit_text("⚠️ У этого врача нет доступных дат на ближайшие 2 недели.")
+        except Exception:
+            await callback.message.answer("⚠️ У этого врача нет доступных дат на ближайшие 2 недели.")
+        return
+
+    # Используем новый календарь
+    calendar_markup = await SimpleCalendar().start_calendar(
+        available_dates=dates,
+        days_ahead=14
+    )
+
+    try:
+        await callback.message.edit_text(
+            "📅 Выберите дату приёма:\n\n"
+            "📍 - сегодня | 🌴 - выходной\n"
+            "Только доступные даты активны",
+            reply_markup=calendar_markup
+        )
+    except Exception:
+        await callback.message.answer(
+            "📅 Выберите дату приёма:\n\n"
+            "📍 - сегодня | 🌴 - выходной\n"
+            "Только доступные даты активны",
+            reply_markup=calendar_markup
+        )
+
+    await state.set_state(BookingStates.date)
+
+
+# === Обработчик выбора даты из календаря ===
+@router.callback_query(BookingStates.date, SimpleCalendarCallback.filter())
+async def process_calendar_selection(callback: CallbackQuery, callback_data: SimpleCalendarCallback, state: FSMContext):
+    success, selected_date = await SimpleCalendar.process_selection(callback, callback_data)
+
+    if success and selected_date:
+        # Пользователь выбрал дату
+        date_iso = selected_date.isoformat()
+
+        # Проверяем, доступна ли эта дата для выбранного врача
+        data = await state.get_data()
+        doctor_id = data.get("doctor_id")
+
+        if not doctor_id:
+            await callback.message.answer("❌ Сначала выберите врача.")
+            return
+
+        available_dates = get_available_dates_for_doctor(doctor_id)
+        if date_iso not in available_dates:
+            await callback.answer("❌ Эта дата недоступна для записи", show_alert=True)
+            return
+
+        # Продолжаем процесс как в choose_date
+        await state.update_data(date=date_iso)
+        slots = get_available_slots_for_doctor_on_date(doctor_id, date_iso)
+
+        if not slots:
+            try:
+                await callback.message.edit_text("⏳ На эту дату нет свободных слотов. Выберите другую дату.")
+            except Exception:
+                await callback.message.answer("⏳ На эту дату нет свободных слотов. Выберите другую дату.")
+            return
+
+        # Создаем сетку кнопок времени
+        kb_rows = []
+        row = []
+        for s in slots:
+            sched_id, time_str = s
+            row.append(InlineKeyboardButton(text=time_str, callback_data=f"choose_time_{sched_id}"))
+            if len(row) == 3:
+                kb_rows.append(row)
+                row = []
+        if row:
+            kb_rows.append(row)
+
+        # Кнопки навигации
+        kb_rows.append([InlineKeyboardButton(text="🔙 Назад к датам", callback_data="back_to_calendar")])
+        kb_rows.append([InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")])
+        kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+        try:
+            await callback.message.edit_text(f"🕓 Свободные слоты на {date_iso}:", reply_markup=kb)
+        except Exception:
+            await callback.message.answer(f"🕓 Свободные слоты на {date_iso}:", reply_markup=kb)
+
+        await state.set_state(BookingStates.time)
+
+    elif success and selected_date is None:
+        # Пользователь отменил выбор даты
+        await callback.message.edit_text("❌ Выбор даты отменен.", reply_markup=main_menu_inline())
+        await state.clear()
+
+
+# === Назад к календарю ===
+@router.callback_query(BookingStates.time, F.data == "back_to_calendar")
+async def back_to_calendar(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    data = await state.get_data()
+    doctor_id = data.get("doctor_id")
+    if not doctor_id:
+        await callback.message.answer("❌ Сначала выберите врача.")
+        return
+
+    dates = get_available_dates_for_doctor(doctor_id)
+    calendar_markup = await SimpleCalendar().start_calendar(
+        available_dates=dates,
+        days_ahead=14
+    )
+
+    try:
+        await callback.message.edit_text(
+            "📅 Выберите дату приёма:\n\n"
+            "📍 - сегодня | 🌴 - выходной\n"
+            "Только доступные даты активны",
+            reply_markup=calendar_markup
+        )
+    except Exception:
+        await callback.message.answer(
+            "📅 Выберите дату приёма:\n\n"
+            "📍 - сегодня | 🌴 - выходной\n"
+            "Только доступные даты активны",
+            reply_markup=calendar_markup
+        )
+
+    await state.set_state(BookingStates.date)
+
+
+# === Назад к выбору врача ===
+@router.callback_query(BookingStates.date, F.data == "back_to_doctor")
+async def back_to_doctor(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    data = await state.get_data()
+    service_id = data.get("service_id")
+    if not service_id:
+        # если нет сервиса в памяти — просто вернёмся в меню услуг
+        services = get_services()
+        items = [(f"{s[1]} — {s[3]}₽", f"choose_service_{s[0]}") for s in services]
+        kb = build_list_kb(items, footer_rows=nav_footer())
+        try:
+            await callback.message.edit_text("🧾 Выберите услугу:", reply_markup=kb)
+        except Exception:
+            await callback.message.answer("🧾 Выберите услугу:", reply_markup=kb)
+        await state.set_state(BookingStates.service)
+        return
+
+    doctors = get_doctors_by_service(service_id)
+    items = [(f"{d[1]} ({d[2] or 'специальность'})", f"choose_doctor_{d[0]}") for d in doctors]
+    kb = build_list_kb(items, footer_rows=nav_footer("back_to_service"))
+    try:
+        await callback.message.edit_text("👩‍⚕️ Выберите врача:", reply_markup=kb)
+    except Exception:
+        await callback.message.answer("👩‍⚕️ Выберите врача:", reply_markup=kb)
+    await state.set_state(BookingStates.doctor)
+
+
+# === Выбор времени -> выбор питомца ===
+@router.callback_query(BookingStates.time, F.data.startswith("choose_time_"))
+async def choose_time(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    try:
+        schedule_id = int(callback.data.split("_")[-1])
+    except Exception:
+        await callback.message.answer("❌ Неправильный формат времени.")
+        return
+
+    await state.update_data(schedule_id=schedule_id)
+
+    user = get_user_by_telegram_id(callback.from_user.id)
+    if not user:
+        await callback.message.answer("❗ Пользователь не найден. Введите /start.")
+        return
+
+    pets = get_user_pets(user[0])
+
+    if not pets:
+        # предложим перейти в раздел "Мои питомцы" (чтобы добавить)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить питомца", callback_data="add_pet")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")]
+        ])
+        try:
+            await callback.message.edit_text(
+                "🐾 У вас пока нет питомцев. Чтобы записаться — сначала добавьте питомца.",
+                reply_markup=kb
+            )
+        except Exception:
+            await callback.message.answer(
+                "🐾 У вас пока нет питомцев. Чтобы записаться — сначала добавьте питомца.",
+                reply_markup=kb
+            )
+        await state.set_state(BookingStates.pet)
+        return
+
+    items = [(p[1], f"choose_pet_{p[0]}") for p in pets]
+    kb = build_list_kb(items, footer_rows=nav_footer("back_to_time"))
+
+    try:
+        await callback.message.edit_text("🐶 Выберите питомца для записи:", reply_markup=kb)
+    except Exception:
+        await callback.message.answer("🐶 Выберите питомца для записи:", reply_markup=kb)
+
+    await state.set_state(BookingStates.pet)
+
+
+# === Назад ко времени ===
+@router.callback_query(BookingStates.pet, F.data == "back_to_time")
+async def back_to_time(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    data = await state.get_data()
+    doctor_id = data.get("doctor_id")
+    date_iso = data.get("date")
+    if not (doctor_id and date_iso):
+        await callback.message.answer("❌ Сначала выберите врача и дату.")
+        return
+
+    slots = get_available_slots_for_doctor_on_date(doctor_id, date_iso)
+    # строим сетку как в choose_date
+    if not slots:
+        await callback.message.edit_text("⏳ Нет доступных слотов на выбранную дату.")
+        return
+
+    kb_rows = []
+    row = []
+    for s in slots:
+        sched_id, time_str = s
+        row.append(InlineKeyboardButton(text=time_str, callback_data=f"choose_time_{sched_id}"))
+        if len(row) == 3:
+            kb_rows.append(row)
+            row = []
+    if row:
+        kb_rows.append(row)
+    kb_rows.append([InlineKeyboardButton(text="🔙 Назад к датам", callback_data="back_to_calendar")])
+    kb_rows.append([InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    try:
+        await callback.message.edit_text("🕓 Выберите время:", reply_markup=kb)
+    except Exception:
+        await callback.message.answer("🕓 Выберите время:", reply_markup=kb)
+
+    await state.set_state(BookingStates.time)
+
+
+# === Выбор питомца -> финализация записи ===
+@router.callback_query(BookingStates.pet, F.data.startswith("choose_pet_"))
+async def choose_pet(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    try:
+        pet_id = int(callback.data.split("_")[-1])
+    except Exception:
+        await callback.message.answer("❌ Неправильный формат выбора питомца.")
+        return
+
+    await state.update_data(pet_id=pet_id)
+    data = await state.get_data()
+
+    schedule_id = data.get("schedule_id")
+    user = get_user_by_telegram_id(callback.from_user.id)
+    service_id = data.get("service_id")
+    date_iso = data.get("date")
+
+    if not (schedule_id and user and service_id and date_iso):
+        await callback.message.answer("❌ Ошибка данных. Пожалуйста, начните запись заново.")
+        await state.clear()
+        return
+
+    try:
+        appointment_id = book_slot(schedule_id, user[0], pet_id, service_id)
+    except ValueError as e:
+        await callback.message.answer(f"⚠️ Невозможно забронировать слот: {e}")
+        await state.clear()
+        return
+
+    # Получаем информацию для красивого подтверждения
+    from db.db_utils import connect
+    with connect() as conn:
+        cur = conn.cursor()
+        # Получаем информацию о питомце
+        cur.execute("SELECT name FROM pets WHERE id = ?", (pet_id,))
+        pet_name = cur.fetchone()[0]
+
+        # Получаем информацию об услуге
+        cur.execute("SELECT name FROM services WHERE id = ?", (service_id,))
+        service_name = cur.fetchone()[0]
+
+        # Получаем информацию о враче
+        doctor_id = data.get("doctor_id")
+        cur.execute("SELECT full_name FROM doctors WHERE id = ?", (doctor_id,))
+        doctor_name = cur.fetchone()[0]
+
+        # Получаем время
+        cur.execute("SELECT time FROM schedule WHERE id = ?", (schedule_id,))
+        time_str = cur.fetchone()[0]
+
+    # подтверждение
+    text = (
+        f"✅ <b>Запись успешно создана!</b>\n\n"
+        f"🐾 <b>Питомец:</b> {pet_name}\n"
+        f"👩‍⚕️ <b>Врач:</b> {doctor_name}\n"
+        f"🧾 <b>Услуга:</b> {service_name}\n"
+        f"📅 <b>Дата и время:</b> {date_iso} в {time_str}\n\n"
+        f"<i>Номер записи: #{appointment_id}</i>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Мои записи", callback_data="my_appointments")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")]
+    ])
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+    await state.clear()
+
+============================================================
+ФАЙЛ: handlers\calendar.py
+============================================================
+
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.filters.callback_data import CallbackData
+from datetime import datetime, timedelta, date
+from typing import Optional, Tuple
+
+
+class SimpleCalendarCallback(CallbackData, prefix="simple_cal"):
+    action: str  # "select", "ignore"
+    date_iso: str  # YYYY-MM-DD
+
+
+class SimpleCalendar:
+
+    @staticmethod
+    async def start_calendar(available_dates: list, days_ahead: int = 7) -> InlineKeyboardMarkup:
+        """
+        Создает календарь на ближайшие days_ahead дней с учетом доступных дат
+        """
+        today = date.today()
+        markup = []
+
+        # Заголовок
+        markup.append([
+            InlineKeyboardButton(
+                text="📅 Выберите дату",
+                callback_data=SimpleCalendarCallback(
+                    action="ignore",
+                    date_iso="header"
+                ).pack()
+            )
+        ])
+
+        # Создаем правильный порядок дней недели для отображаемого периода
+        week_days_header = []
+        current_header_date = today
+
+        for i in range(days_ahead):
+            day_index = current_header_date.weekday()
+            day_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+            week_days_header.append(day_names[day_index])
+            current_header_date += timedelta(days=1)
+
+        # Заголовок дней недели
+        markup.append([
+            InlineKeyboardButton(
+                text=day,
+                callback_data=SimpleCalendarCallback(action="ignore", date_iso=f"wd_{i}").pack()
+            ) for i, day in enumerate(week_days_header)
+        ])
+
+        # Генерируем кнопки с датами
+        current_date = today
+        date_buttons = []
+
+        for i in range(days_ahead):
+            day_number = current_date.day
+            date_iso = current_date.isoformat()
+
+            # Форматируем текст кнопки
+            if current_date == today:
+                button_text = f"📍{day_number}"
+            elif current_date.weekday() >= 5:  # Суббота и воскресенье
+                button_text = f"🌴{day_number}"
+            else:
+                button_text = f"{day_number}"
+
+            # Проверяем доступность даты
+            if date_iso in available_dates:
+                date_buttons.append(
+                    InlineKeyboardButton(
+                        text=button_text,
+                        callback_data=SimpleCalendarCallback(
+                            action="select",
+                            date_iso=date_iso
+                        ).pack()
+                    )
+                )
+            else:
+                date_buttons.append(
+                    InlineKeyboardButton(
+                        text="·",
+                        callback_data=SimpleCalendarCallback(action="ignore", date_iso="unavailable").pack()
+                    )
+                )
+
+            current_date += timedelta(days=1)
+
+        # Разбиваем на строки (можно настроить количество кнопок в строке)
+        buttons_per_row = 7  # Все дни в одной строке
+        for i in range(0, len(date_buttons), buttons_per_row):
+            markup.append(date_buttons[i:i + buttons_per_row])
+
+        # Подпись с диапазоном дат
+        end_date = today + timedelta(days=days_ahead - 1)
+        date_range = f"{today.strftime('%d.%m')}-{end_date.strftime('%d.%m')}"
+        markup.append([
+            InlineKeyboardButton(
+                text=f"📆 {date_range}",
+                callback_data=SimpleCalendarCallback(action="ignore", date_iso="range").pack()
+            )
+        ])
+
+        # Легенда
+        markup.append([
+            InlineKeyboardButton(text="📍 - сегодня",
+                                 callback_data=SimpleCalendarCallback(action="ignore", date_iso="legend_today").pack()),
+            InlineKeyboardButton(text="🌴 - выходной", callback_data=SimpleCalendarCallback(action="ignore",
+                                                                                           date_iso="legend_weekend").pack())
+        ])
+
+        # Кнопки навигации
+        markup.append([
+            InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data=SimpleCalendarCallback(action="ignore", date_iso="cancel").pack()
+            )
+        ])
+
+        return InlineKeyboardMarkup(inline_keyboard=markup)
+
+    @staticmethod
+    async def process_selection(query: CallbackQuery, data: SimpleCalendarCallback) -> Tuple[bool, Optional[date]]:
+        """
+        Обрабатывает выбор даты
+        Возвращает: (success, selected_date)
+        """
+        if data.action == "ignore":
+            if data.date_iso == "cancel":
+                await query.message.edit_text("❌ Выбор даты отменен")
+                return True, None
+            await query.answer()
+            return False, None
+
+        if data.action == "select":
+            try:
+                selected_date = datetime.strptime(data.date_iso, "%Y-%m-%d").date()
+                await query.answer(f"✅ Выбрана дата: {selected_date.strftime('%d.%m.%Y')}")
+                return True, selected_date
+            except ValueError:
+                await query.answer("❌ Ошибка выбора даты")
+                return False, None
+
+        return False, None
+
+
+# Альтернативная версия календаря, которая всегда показывает полные недели
+class WeekCalendar:
+
+    @staticmethod
+    async def start_calendar(available_dates: list, weeks_ahead: int = 1) -> InlineKeyboardMarkup:
+        """
+        Создает календарь на полные недели
+        """
+        today = date.today()
+        markup = []
+
+        # Заголовок
+        markup.append([
+            InlineKeyboardButton(
+                text="📅 Выберите дату",
+                callback_data=SimpleCalendarCallback(action="ignore", date_iso="header").pack()
+            )
+        ])
+
+        # Стандартные дни недели
+        week_days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+        markup.append([
+            InlineKeyboardButton(text=day,
+                                 callback_data=SimpleCalendarCallback(action="ignore", date_iso=f"wd_{i}").pack())
+            for i, day in enumerate(week_days)
+        ])
+
+        # Находим понедельник текущей недели
+        days_since_monday = today.weekday()
+        start_date = today - timedelta(days=days_since_monday)
+
+        # Генерируем недели
+        current_date = start_date
+        total_days = weeks_ahead * 7
+
+        for week in range(weeks_ahead):
+            week_row = []
+            for day in range(7):
+                date_iso = current_date.isoformat()
+                day_number = current_date.day
+
+                # Форматируем текст кнопки
+                if current_date == today:
+                    button_text = f"📍{day_number}"
+                elif current_date.weekday() >= 5:
+                    button_text = f"🌴{day_number}"
+                else:
+                    button_text = f"{day_number}"
+
+                # Проверяем доступность (только будущие даты)
+                is_available = date_iso in available_dates and current_date >= today
+
+                if is_available:
+                    week_row.append(
+                        InlineKeyboardButton(
+                            text=button_text,
+                            callback_data=SimpleCalendarCallback(action="select", date_iso=date_iso).pack()
+                        )
+                    )
+                else:
+                    week_row.append(
+                        InlineKeyboardButton(
+                            text="·",
+                            callback_data=SimpleCalendarCallback(action="ignore", date_iso="unavailable").pack()
+                        )
+                    )
+
+                current_date += timedelta(days=1)
+
+            markup.append(week_row)
+
+        # Подпись с диапазоном дат
+        end_date = start_date + timedelta(days=total_days - 1)
+        date_range = f"{start_date.strftime('%d.%m')}-{end_date.strftime('%d.%m')}"
+        markup.append([
+            InlineKeyboardButton(
+                text=f"📆 {date_range}",
+                callback_data=SimpleCalendarCallback(action="ignore", date_iso="range").pack()
+            )
+        ])
+
+        # Кнопки навигации
+        markup.append([
+            InlineKeyboardButton(text="❌ Отмена",
+                                 callback_data=SimpleCalendarCallback(action="ignore", date_iso="cancel").pack())
+        ])
+
+        return InlineKeyboardMarkup(inline_keyboard=markup)
+
+============================================================
+ФАЙЛ: handlers\common.py
+============================================================
+
+from aiogram import Router, F
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
+from aiogram.fsm.context import FSMContext
+
+router = Router()
+
+# Главное меню через inline-кнопки
+def main_menu_inline():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🐾 Мои питомцы", callback_data="my_pets")],
+        [InlineKeyboardButton(text="📅 Записаться к врачу", callback_data="book_visit")],
+        [InlineKeyboardButton(text="🧾 Мои записи", callback_data="my_appointments")],
+    ])
+
+
+# === Приветствие / старт ===
+@router.message(F.text.in_({"/start", "/menu"}))
+async def start_message(message: Message, state: FSMContext):
+    await state.clear()
+    user_name = message.from_user.full_name or message.from_user.username or "друг"
+    await message.answer(
+        f"🐾 Привет, {user_name}!\nВыберите действие ниже:",
+        reply_markup=main_menu_inline()
+    )
+
+
+@router.callback_query(F.data == "back_to_menu")
+async def back_to_menu(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    welcome_id = data.get("welcome_message_id")
+    sent_messages = data.get("sent_messages", [])
+
+    # Удаляем все предыдущие сообщения бота, кроме приветствия
+    for msg_id in sent_messages:
+        if msg_id != welcome_id:
+            try:
+                await callback.message.bot.delete_message(chat_id=callback.from_user.id, message_id=msg_id)
+            except:
+                pass  # если сообщение уже удалено или нельзя удалить, игнорируем
+
+    # Сбрасываем список сообщений, оставляем только приветствие
+    await state.update_data(sent_messages=[welcome_id])
+
+    # Отправляем новое главное меню
+    try:
+        sent_menu = await callback.message.edit_text("🏠 Главное меню:", reply_markup=main_menu_inline())
+    except:
+        sent_menu = await callback.message.answer("🏠 Главное меню:", reply_markup=main_menu_inline())
+
+    # Добавляем ID нового меню в список сообщений
+    data = await state.get_data()
+    messages = data.get("sent_messages", [])
+    messages.append(sent_menu.message_id)
+    await state.update_data(sent_messages=messages)
+
+    await callback.answer()
+
+async def add_message_to_state(message, state):
+    data = await state.get_data()
+    messages = data.get("sent_messages", [])
+    messages.append(message.message_id)
+    await state.update_data(sent_messages=messages)
+
+async def delete_previous_messages(message, state, keep_ids=[]):
+    data = await state.get_data()
+    messages = data.get("sent_messages", [])
+
+    for msg_id in messages:
+        if msg_id not in keep_ids:
+            try:
+                await message.bot.delete_message(chat_id=message.chat.id, message_id=msg_id)
+            except Exception:
+                pass  # сообщение могло быть уже удалено
+
+    remaining = [mid for mid in messages if mid in keep_ids]
+    await state.update_data(sent_messages=remaining)
+
+
+============================================================
+ФАЙЛ: handlers\notifications.py
+============================================================
+
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from aiogram import Router
+from aiogram.types import Message
+from db.db_utils import connect
+
+router = Router()
+
+# === Получение предстоящих приёмов ===
+def get_upcoming_appointments():
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 
+                a.id,
+                u.telegram_id,
+                p.name AS pet_name,
+                d.full_name AS doctor_name,
+                s.name AS service_name,
+                sch.date,
+                sch.time,
+                a.notified_24h,
+                a.notified_2h
+            FROM appointments a
+            JOIN users u ON a.user_id = u.id
+            JOIN pets p ON a.pet_id = p.id
+            JOIN doctors d ON a.doctor_id = d.id
+            JOIN services s ON a.service_id = s.id
+            JOIN schedule sch ON a.schedule_id = sch.id
+            WHERE a.status = 'scheduled'
+        """)
+        return cur.fetchall()
+
+# === Проверка и отправка уведомлений ===
+async def check_and_send_notifications(bot):
+    now = datetime.now()
+    upcoming = get_upcoming_appointments()
+
+    for appt in upcoming:
+        (
+            appointment_id,
+            telegram_id,
+            pet_name,
+            doctor_name,
+            service_name,
+            appt_date,
+            appt_time,
+            notified_24h,
+            notified_2h
+        ) = appt
+
+        try:
+            appt_datetime = datetime.strptime(f"{appt_date} {appt_time}", "%Y-%m-%d %H:%M")
+        except Exception:
+            continue
+
+        time_until = appt_datetime - now
+
+        # === За 24 часа ===
+        if timedelta(hours=23, minutes=50) < time_until < timedelta(hours=24, minutes=10) and not notified_24h:
+            await bot.send_message(
+                telegram_id,
+                f"📅 Напоминание!\n"
+                f"Через сутки у вас приём:\n\n"
+                f"🐾 Питомец: {pet_name}\n"
+                f"👩‍⚕️ Врач: {doctor_name}\n"
+                f"🧾 Услуга: {service_name}\n"
+                f"🕓 Время: {appt_time} ({appt_date})"
+            )
+            mark_notified(appointment_id, "24h")
+
+        # === За 2 часа ===
+        elif timedelta(hours=1, minutes=50) < time_until < timedelta(hours=2, minutes=10) and not notified_2h:
+            await bot.send_message(
+                telegram_id,
+                f"⏰ Напоминание!\n"
+                f"Через 2 часа у вас приём:\n\n"
+                f"🐾 Питомец: {pet_name}\n"
+                f"👩‍⚕️ Врач: {doctor_name}\n"
+                f"🧾 Услуга: {service_name}\n"
+                f"🕓 Время: {appt_time} ({appt_date})"
+            )
+            mark_notified(appointment_id, "2h")
+
+# === Пометка об отправке ===
+def mark_notified(appointment_id: int, kind: str):
+    with connect() as conn:
+        cur = conn.cursor()
+        if kind == "24h":
+            cur.execute("UPDATE appointments SET notified_24h = 1 WHERE id = ?", (appointment_id,))
+        elif kind == "2h":
+            cur.execute("UPDATE appointments SET notified_2h = 1 WHERE id = ?", (appointment_id,))
+        conn.commit()
+
+# === Фоновая задача ===
+async def notifications_scheduler(bot):
+    logging.info("🔔 Система уведомлений запущена...")
+    while True:
+        await check_and_send_notifications(bot)
+        await asyncio.sleep(300)  # каждые 5 минут
+
+# === Ручная проверка (для теста) ===
+@router.message(lambda msg: msg.text == "/check_notifications")
+async def manual_check(message: Message):
+    await check_and_send_notifications(message.bot)
+    await message.answer("🔍 Проверка уведомлений выполнена.")
+
+
+============================================================
+ФАЙЛ: handlers\pets.py
+============================================================
+
+# handlers/pets.py
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.filters import StateFilter
+
+from db.db_utils import get_user_by_telegram_id, get_user_pets, add_pet, connect
+from handlers.common import main_menu_inline
+
+router = Router()
+
+
+# === Состояния FSM для добавления питомца ===
+class PetState(StatesGroup):
+    waiting_name = State()
+    waiting_species = State()
+    waiting_age = State()
+
+
+# === Клавиатура питомцев ===
+def pets_keyboard(pets):
+    kb = []
+    for pet in pets:
+        pet_id, name, species, age = pet
+        kb.append([InlineKeyboardButton(text=f"❌ Удалить {name}", callback_data=f"delete_pet_{pet_id}")])
+    kb.append([InlineKeyboardButton(text="➕ Добавить питомца", callback_data="add_pet")])
+    kb.append([InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+# === Просмотр питомцев ===
+@router.callback_query(F.data == "my_pets")
+async def show_my_pets(callback: CallbackQuery):
+    user = get_user_by_telegram_id(callback.from_user.id)
+    if not user:
+        await callback.message.answer("❗ Вы не зарегистрированы. Введите /start.")
+        await callback.answer()
+        return
+
+    pets = get_user_pets(user[0])
+    if not pets:
+        text = "🐾 У вас пока нет питомцев."
+    else:
+        text = "🐾 Ваши питомцы:\n\n"
+        for p in pets:
+            text += f"• {p[1]} ({p[2] or 'вид не указан'}, {p[3] or 'возраст не указан'})\n"
+
+    kb = pets_keyboard(pets)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+
+
+# === Удаление питомца ===
+@router.callback_query(F.data.startswith("delete_pet_"))
+async def delete_pet(callback: CallbackQuery):
+    pet_id = int(callback.data.split("_")[-1])
+    user = get_user_by_telegram_id(callback.from_user.id)
+    if not user:
+        await callback.answer("Пользователь не найден.")
+        return
+
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM pets WHERE id=? AND user_id=?", (pet_id, user[0]))
+        conn.commit()
+
+    pets = get_user_pets(user[0])
+    if not pets:
+        text = "🐾 У вас больше нет питомцев."
+    else:
+        text = "🐾 Ваши питомцы:\n\n"
+        for p in pets:
+            text += f"• {p[1]} ({p[2] or 'вид не указан'}, {p[3] or 'возраст не указан'})\n"
+
+    kb = pets_keyboard(pets)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb)
+    await callback.answer("✅ Питомец удалён.")
+
+
+# === Добавление питомца ===
+@router.callback_query(F.data == "add_pet")
+async def add_pet_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(PetState.waiting_name)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Отмена", callback_data="cancel_pet_add")]
+    ])
+
+    await callback.message.edit_text("🐶 Как зовут вашего питомца?\n\n(введите имя в сообщении)", reply_markup=kb)
+    await callback.answer()
+
+
+@router.message(StateFilter(PetState.waiting_name))
+async def pet_name_entered(message: Message, state: FSMContext):
+    name = message.text.strip()
+    if not name:
+        await message.answer("⚠️ Имя не может быть пустым. Введите имя питомца.")
+        return
+
+    await state.update_data(pet_name=name)
+    await state.set_state(PetState.waiting_species)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🐱 Кошка", callback_data="species_Кошка"),
+         InlineKeyboardButton(text="🐶 Собака", callback_data="species_Собака")],
+        [InlineKeyboardButton(text="🐹 Грызун", callback_data="species_Грызун"),
+         InlineKeyboardButton(text="🦜 Птица", callback_data="species_Птица")],
+        [InlineKeyboardButton(text="🦎 Рептилия", callback_data="species_Рептилия"),
+         InlineKeyboardButton(text="🐠 Рыба", callback_data="species_Рыба")],
+        [InlineKeyboardButton(text="🐇 Кролик", callback_data="species_Кролик"),
+         InlineKeyboardButton(text="🐢 Черепаха", callback_data="species_Черепаха")],
+        [InlineKeyboardButton(text="❓ Другое", callback_data="species_Другое")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_name"),
+         InlineKeyboardButton(text="🏠 Отмена", callback_data="cancel_pet_add")]
+    ])
+
+    await message.answer("🐾 Выберите вид питомца:", reply_markup=kb)
+
+
+# === Выбор вида ===
+@router.callback_query(StateFilter(PetState.waiting_species), F.data.startswith("species_"))
+async def pet_species_selected(callback: CallbackQuery, state: FSMContext):
+    species = callback.data.split("_", 1)[1]
+    await state.update_data(pet_species=species)
+    await state.set_state(PetState.waiting_age)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🍼 До 1 года", callback_data="age_До 1 года")],
+        [InlineKeyboardButton(text="🐕 От 1 до 5 лет", callback_data="age_От 1 до 5 лет")],
+        [InlineKeyboardButton(text="🐾 От 5 до 10 лет", callback_data="age_От 5 до 10 лет")],
+        [InlineKeyboardButton(text="🦴 Более 10 лет", callback_data="age_Более 10 лет")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_species"),
+         InlineKeyboardButton(text="🏠 Отмена", callback_data="cancel_pet_add")]
+    ])
+
+    await callback.message.edit_text(f"Выбран вид: {species}\n🕐 Укажите возраст питомца:", reply_markup=kb)
+    await callback.answer()
+
+
+# === Выбор возраста ===
+@router.callback_query(StateFilter(PetState.waiting_age), F.data.startswith("age_"))
+async def pet_age_selected(callback: CallbackQuery, state: FSMContext):
+    age = callback.data.split("_", 1)[1]
+
+    data = await state.get_data()
+    pet_name = data.get("pet_name")
+    pet_species = data.get("pet_species")
+
+    user = get_user_by_telegram_id(callback.from_user.id)
+    if not user:
+        await callback.message.answer("❗ Пользователь не найден. Введите /start.")
+        await state.clear()
+        return
+
+    add_pet(user_id=user[0], name=pet_name, species=pet_species, age=age)
+    await state.clear()
+
+    pets = get_user_pets(user[0])
+    text = "🐾 Ваши питомцы:\n\n"
+    for p in pets:
+        text += f"• {p[1]} ({p[2] or 'вид не указан'}, {p[3] or 'возраст не указан'})\n"
+
+    kb = pets_keyboard(pets)
+    await callback.message.edit_text(f"✅ Питомец {pet_name} ({pet_species}, {age}) добавлен!", reply_markup=kb)
+    await callback.answer()
+
+
+# === Кнопка "Назад" и "Отмена" ===
+@router.callback_query(F.data == "back_to_name")
+async def back_to_name(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(PetState.waiting_name)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Отмена", callback_data="cancel_pet_add")]
+    ])
+    await callback.message.edit_text("🐶 Как зовут вашего питомца? (введите имя)", reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "back_to_species")
+async def back_to_species(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(PetState.waiting_species)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🐱 Кошка", callback_data="species_Кошка"),
+         InlineKeyboardButton(text="🐶 Собака", callback_data="species_Собака")],
+        [InlineKeyboardButton(text="🐹 Грызун", callback_data="species_Грызун"),
+         InlineKeyboardButton(text="🦜 Птица", callback_data="species_Птица")],
+        [InlineKeyboardButton(text="🦎 Рептилия", callback_data="species_Рептилия"),
+         InlineKeyboardButton(text="🐠 Рыба", callback_data="species_Рыба")],
+        [InlineKeyboardButton(text="🐇 Кролик", callback_data="species_Кролик"),
+         InlineKeyboardButton(text="🐢 Черепаха", callback_data="species_Черепаха")],
+        [InlineKeyboardButton(text="❓ Другое", callback_data="species_Другое")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_name"),
+         InlineKeyboardButton(text="🏠 Отмена", callback_data="cancel_pet_add")]
+    ])
+    await callback.message.edit_text("🐾 Выберите вид питомца:", reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cancel_pet_add")
+async def cancel_pet_add(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ Добавление питомца отменено.", reply_markup=main_menu_inline)
+    await callback.answer("Действие отменено.")
+
+
+============================================================
+ФАЙЛ: handlers\registration.py
+============================================================
+
+# handlers/registration.py
+from aiogram import Router, F, types
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from db.db_utils import get_user_by_telegram_id, add_user, add_pet
+from handlers.common import main_menu_inline
+
+router = Router()
+
+
+# === Состояния FSM ===
+class RegistrationState(StatesGroup):
+    waiting_phone = State()
+    waiting_pet_name = State()
+    waiting_pet_species = State()
+    waiting_pet_age = State()
+
+WELCOME_TEXT = (
+    "👋 Добро пожаловать в *Усы, лапы и хвост*! 🐾\n\n"
+    "Мы заботимся о здоровье ваших питомцев и предлагаем полный спектр ветеринарных услуг:\n\n"
+    "🩺 Консультации и приёмы опытных врачей - от 1200 рублей\n"
+    "🐶 Лечение и уход за собаками, кошками и другими питомцами - от 300 рублей\n"
+    "💉 Вакцинация, чипирование и профилактика заболеваний - от 800 рублей\n"
+    "🧾 Удобная запись на приём прямо через Telegram-бота\n\n"
+    "🌟 Наши преимущества:\n"
+    "• Дружелюбная атмосфера и заботливый персонал\n"
+    "• Современное оборудование и проверенные методики\n"
+    "• Напоминания о приёме и удобный доступ к вашим питомцам\n\n"
+)
+
+@router.message(F.text == "/start")
+async def start_command(message: types.Message, state: FSMContext):
+    user = get_user_by_telegram_id(message.from_user.id)
+
+    # --- Отправляем рекламное приветственное сообщение ---
+    sent_welcome = await message.answer(WELCOME_TEXT)
+
+    # Сохраняем ID приветственного сообщения в state
+    await state.update_data(
+        welcome_message_id=sent_welcome.message_id,
+        sent_messages=[sent_welcome.message_id]  # список всех сообщений бота
+    )
+
+    if user:
+        # Пользователь уже зарегистрирован
+        sent_menu = await message.answer(
+            f"👋 С возвращением, {user[3] or message.from_user.full_name}! "
+            "Выберите действие ниже, чтобы начать пользоваться ботом 🏥",
+            reply_markup=main_menu_inline()
+        )
+        # Добавляем меню в список сообщений
+        data = await state.get_data()
+        messages = data.get("sent_messages", [])
+        messages.append(sent_menu.message_id)
+        await state.update_data(sent_messages=messages)
+        return
+
+    # --- Новая регистрация — запрос телефона ---
+    contact_btn = KeyboardButton(text="📱 Отправить номер телефона", request_contact=True)
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[[contact_btn]])
+    sent_phone_request = await message.answer(
+        "Пожалуйста, поделитесь вашим номером телефона, чтобы мы могли зарегистрировать вас:",
+        reply_markup=kb
+    )
+    # Добавляем в список сообщений
+    data = await state.get_data()
+    messages = data.get("sent_messages", [])
+    messages.append(sent_phone_request.message_id)
+    await state.update_data(sent_messages=messages)
+
+    await state.set_state(RegistrationState.waiting_phone)
+
+# === Получаем номер телефона ===
+@router.message(RegistrationState.waiting_phone, F.contact)
+async def process_phone(message: types.Message, state: FSMContext):
+    phone = message.contact.phone_number
+    full_name = message.from_user.full_name
+
+    add_user(telegram_id=message.from_user.id, phone=phone, full_name=full_name)
+
+    await state.update_data(phone=phone, full_name=full_name)
+    await state.set_state(RegistrationState.waiting_pet_name)
+
+    await message.answer("🐾 Теперь добавим вашего питомца!\nВведите имя питомца:", reply_markup=types.ReplyKeyboardRemove())
+
+
+# === Имя питомца ===
+@router.message(RegistrationState.waiting_pet_name)
+async def pet_name(message: types.Message, state: FSMContext):
+    name = message.text.strip()
+    if not name:
+        await message.answer("⚠️ Имя не может быть пустым. Введите имя питомца.")
+        return
+
+    await state.update_data(pet_name=name)
+    await state.set_state(RegistrationState.waiting_pet_species)
+    await message.answer("🐶 Укажите вид питомца (например: кошка, собака):")
+
+
+# === Вид питомца ===
+@router.message(RegistrationState.waiting_pet_species)
+async def pet_species(message: types.Message, state: FSMContext):
+    species = message.text.strip()
+    if not species:
+        await message.answer("⚠️ Укажите вид питомца (например: кошка, собака).")
+        return
+
+    await state.update_data(pet_species=species)
+    await state.set_state(RegistrationState.waiting_pet_age)
+    await message.answer("🕐 Укажите возраст питомца (в годах, можно дробно):")
+
+
+# === Возраст питомца ===
+@router.message(RegistrationState.waiting_pet_age)
+async def pet_age(message: types.Message, state: FSMContext):
+    age_text = message.text.strip()
+    age = None
+    if age_text:
+        try:
+            _ = float(age_text.replace(",", "."))
+            age = age_text
+        except Exception:
+            await message.answer("⚠️ Некорректный формат возраста. Введите число (например: 3 или 2.5) или оставьте пустым.")
+            return
+
+    data = await state.get_data()
+    user = get_user_by_telegram_id(message.from_user.id)
+    if not user:
+        await message.answer("❗ Ошибка регистрации. Попробуйте снова /start.")
+        await state.clear()
+        return
+
+    add_pet(
+        user_id=user[0],
+        name=data.get("pet_name"),
+        species=data.get("pet_species"),
+        age=age
+    )
+
+    await state.clear()
+
+    await message.answer(
+        f"✅ Регистрация завершена!\nПитомец {data.get('pet_name')} ({data.get('pet_species')}) успешно добавлен!",
+        reply_markup=main_menu_inline()
+    )
+
+
+
+============================================================
+ФАЙЛ: handlers\__init__.py
+============================================================
+
+
+
+============================================================
+ФАЙЛ: services\scheduler.py
+============================================================
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from datetime import datetime
+import asyncio
+
+async def send_reminders(bot):
+    now = datetime.now().strftime("%H:%M:%S")
+    await bot.send_message(
+        chat_id=123456789,  # 🔸 временно можно подставить свой Telegram ID
+        text=f"🔔 Тестовое напоминание — {now}"
+    )
+
+def setup_scheduler(bot):
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(send_reminders, "interval", minutes=30, args=(bot,))
+    scheduler.start()
+
+
+============================================================
+ФАЙЛ: services\utils.py
+============================================================
+
+def format_datetime(date: str, time: str):
+    return f"{date} в {time}"
+# Общие вспомогательные функции
+
+
+============================================================
+ФАЙЛ: services\__init__.py
+============================================================
+
+
