@@ -13,7 +13,7 @@ from db.db_init import init_db
 # Роутеры
 from handlers import registration, pets, booking, common, notifications, appointments, calendar
 
-# === Логирование ===
+# ===Логирование===
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -86,3 +86,4 @@ async def main_polling():
 if __name__ == "__main__":
     # Всегда используем поллинг (и в Railway и локально)
     asyncio.run(main_polling())
+
